@@ -5,9 +5,9 @@ from collections import deque
 import numpy as np
 
 # -------- TCP Setup to Raspberry Pi --------
-RPI_IP = '192.168.1.100'  # Raspberry Pi IP
+RPI_IP = '192.168.1.100'
 RPI_PORT = 5005
-RECONNECT_DELAY = 5        # seconds
+RECONNECT_DELAY = 5
 
 def connect_to_pi():
     while True:
@@ -16,17 +16,17 @@ def connect_to_pi():
             s.connect((RPI_IP, RPI_PORT))
             print("Connected to Raspberry Pi")
             return s
-        except Exception as e:
+        except:
             print("Failed to connect, retrying in", RECONNECT_DELAY, "s")
             time.sleep(RECONNECT_DELAY)
 
-#s = connect_to_pi()
+# s = connect_to_pi()
 
 def send_command(cmd):
     global s
     try:
         s.sendall(f"{cmd}\n".encode())
-    except Exception as e:
+    except:
         print("Connection lost, reconnecting...")
         s.close()
         s = connect_to_pi()
@@ -38,14 +38,26 @@ OBSTACLE_THRESHOLD = 3000
 SMOOTH_FRAMES = 3
 frame_queue = deque(maxlen=SMOOTH_FRAMES)
 
-# -------- Threshold Helper --------
-def auto_threshold(frame):
-    # Use Otsu; fallback to fixed threshold if needed
-    try:
-        _, thresh = cv2.threshold(frame, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        return thresh
-    except:
-        return cv2.threshold(frame, 80, 255, cv2.THRESH_BINARY_INV)[1]
+# -------- Improved Threshold Function --------
+def get_clean_mask(gray_roi):
+    # Normalize lighting
+    norm = cv2.normalize(gray_roi, None, 0, 255, cv2.NORM_MINMAX)
+
+    # Blur to remove tiny noise
+    blur = cv2.GaussianBlur(norm, (7,7), 0)
+
+    # Adaptive Threshold (better than Otsu in real life)
+    mask = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 7
+    )
+
+    # Morphological cleanup
+    kernel = np.ones((5,5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)   # remove noise dots
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)  # remove holes
+
+    return mask
 
 # -------- Main Loop --------
 while True:
@@ -54,18 +66,21 @@ while True:
         print("Camera not detected")
         break
 
-    gray = frame if len(frame.shape) == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    h = blur.shape[0]
-    roi = blur[int(h*(1-ROI_RATIO)):, :]
+    # Region of interest (bottom of frame)
+    h = gray.shape[0]
+    roi = gray[int(h*(1-ROI_RATIO)):, :]
 
-    thresh = auto_threshold(roi)
+    # Apply improved mask
+    thresh = get_clean_mask(roi)
 
+    # Find objects using contours
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     obstacle_detected = False
     max_area = 0
+
     for c in contours:
         area = cv2.contourArea(c)
         x, y, w, h_c = cv2.boundingRect(c)
@@ -73,24 +88,20 @@ while True:
 
         if area > OBSTACLE_THRESHOLD and 0.2 < aspect_ratio < 5.0:
             obstacle_detected = True
-            # Draw rectangle at correct position
-            cv2.rectangle(frame, (x, y + int(h*(1-ROI_RATIO))),
-                                 (x + w, y + h_c + int(h*(1-ROI_RATIO))), (0,255,0), 2)
-        if area > max_area:
-            max_area = area
+            cv2.rectangle(frame,
+                (x, y + int(h*(1-ROI_RATIO))),
+                (x+w, y+h_c + int(h*(1-ROI_RATIO))),
+                (0,255,0), 2
+            )
+        max_area = max(max_area, area)
 
-    # Smooth detection over multiple frames
     frame_queue.append(obstacle_detected)
-    if frame_queue.count(True) >= (SMOOTH_FRAMES // 2 + 1):
-        command = "STOP"
-    else:
-        command = "GO"
+    command = "STOP" if frame_queue.count(True) >= 2 else "GO"
 
-    #send_command(command)
+    # Debug text
+    cv2.putText(frame, f"{command} (Area={int(max_area)})",
+                (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
 
-    # Debug overlays
-    cv2.putText(frame, f"{command} (MaxArea={int(max_area)})", (20,40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
     cv2.imshow("Camera Feed", frame)
     cv2.imshow("Threshold Mask", thresh)
 
@@ -100,4 +111,4 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
-s.close()
+# s.close()
